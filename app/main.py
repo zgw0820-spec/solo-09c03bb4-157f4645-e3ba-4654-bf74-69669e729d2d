@@ -21,19 +21,25 @@ from pydantic import BaseModel, Field
 
 from .db import (
     ADD_FK_SQL,
+    CONSTRAINT_BY_NAME_SQL,
+    EQUIVALENT_FK_BY_OID_SQL,
+    EQUIVALENT_FKS_SQL,
     FK_NAME,
+    LOCK_FOR_VALIDATE_SQL,
     ORPHAN_WHERE,
-    STATUS_SQL,
-    VALIDATE_FK_SQL,
     connect,
+    validate_fk_sql,
 )
 
 app = FastAPI(
     title="Online FK migration API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Adds the `inspections.device_id -> devices.id` foreign key online, "
         "while the collector keeps writing directly to PostgreSQL. "
+        "The managed constraint is identified by definition (single column, "
+        "NOT DEFERRABLE, NO ACTION) rather than by name, so manually added "
+        "constraints are recognised and reused. "
         "Enable protection first, clean up orphan rows, then validate."
     ),
 )
@@ -43,29 +49,51 @@ app = FastAPI(
 # helpers
 # ---------------------------------------------------------------------------
 
-def read_fk_status() -> dict[str, Any]:
-    """Actual constraint state from the PostgreSQL catalog.
-
-    The API keeps no in-memory state, so this is correct across restarts.
-    """
-    with connect() as conn:
-        row = conn.execute(STATUS_SQL, {"name": FK_NAME}).fetchone()
-    if row is None:
-        return {
-            "constraint": FK_NAME,
-            "exists": False,
-            "enforced": False,
-            "validated": False,
-            "definition": None,
-        }
-    name, validated, definition = row
+def _fk_row_to_status(row) -> dict[str, Any]:
+    oid, name, validated, definition = row
     return {
         "constraint": name,
+        "oid": oid,
         "exists": True,
         "enforced": True,
         "validated": validated,
         "definition": definition,
     }
+
+
+def find_equivalent_fks(conn) -> list[dict[str, Any]]:
+    """All foreign keys equivalent to the one we manage, best first.
+
+    Identification is by definition (single column inspections.device_id ->
+    devices.id, NOT DEFERRABLE, NO ACTION on update and delete), never by
+    name: a manually added constraint with a different name still counts.
+    Validated constraints sort first.
+    """
+    rows = conn.execute(EQUIVALENT_FKS_SQL).fetchall()
+    return [_fk_row_to_status(r) for r in rows]
+
+
+def read_fk_status() -> dict[str, Any]:
+    """Actual constraint state from the PostgreSQL catalog.
+
+    The API keeps no in-memory state, so this is correct across restarts.
+    A correctly defined constraint is reported whatever its name; unrelated
+    foreign keys (e.g. one aimed at an archive device table) are ignored.
+    """
+    with connect() as conn:
+        found = find_equivalent_fks(conn)
+    if not found:
+        return {
+            "constraint": None,
+            "oid": None,
+            "exists": False,
+            "enforced": False,
+            "validated": False,
+            "definition": None,
+            "equivalent_constraints": [],
+        }
+    best = found[0]
+    return {**best, "equivalent_constraints": [f["constraint"] for f in found]}
 
 
 def orphan_count(conn) -> int:
@@ -112,60 +140,158 @@ def fk_status():
 
 @app.post("/foreign-key/enable", tags=["foreign-key"])
 def fk_enable():
-    """Step 1: add the FK as NOT VALID.
+    """Step 1: add the FK as NOT VALID (no table scan).
 
     Brief catalog lock only, no table scan. From this moment the database
     rejects new/updated inspections pointing at missing devices and refuses
     to delete devices that are still referenced -- even for clients that
     bypass this API and write to PostgreSQL directly.
+
+    Idempotent by definition, not by name: if a manually created constraint
+    already has the right shape, it is reused (and reported as it is). Only
+    when no equivalent constraint exists do we try to add one under the
+    default name; if that name is taken by something else, return 409 and
+    leave the existing constraint untouched.
     """
-    before = read_fk_status()
-    if before["exists"]:
-        return {"changed": False, **before}
-    try:
-        with connect(autocommit=True) as conn:
+    with connect(autocommit=True) as conn:
+        existing = find_equivalent_fks(conn)
+        if existing:
+            best = existing[0]
+            return {
+                "changed": False,
+                **best,
+                "equivalent_constraints": [f["constraint"] for f in existing],
+            }
+        try:
             conn.execute(ADD_FK_SQL)
-    except DuplicateObject:
-        pass  # concurrent enabler won the race; state is what matters
-    return {"changed": True, **read_fk_status()}
+        except DuplicateObject:
+            # Either a concurrent enabler won the race (then an equivalent FK
+            # now exists), or the default name belongs to an unrelated
+            # constraint -- which we must not touch.
+            existing = find_equivalent_fks(conn)
+            if existing:
+                best = existing[0]
+                return {
+                    "changed": False,
+                    **best,
+                    "equivalent_constraints": [
+                        f["constraint"] for f in existing
+                    ],
+                }
+            clash = conn.execute(
+                CONSTRAINT_BY_NAME_SQL, {"name": FK_NAME}
+            ).fetchone()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        f"constraint name {FK_NAME!r} is already used by a "
+                        "different constraint; it was left unchanged"
+                    ),
+                    "constraint": FK_NAME,
+                    "existing": (
+                        {
+                            "name": clash[0],
+                            "type": clash[1],
+                            "validated": clash[2],
+                            "definition": clash[3],
+                        }
+                        if clash is not None
+                        else None
+                    ),
+                },
+            )
+        return {"changed": True, **read_fk_status()}
 
 
 @app.post("/foreign-key/validate", tags=["foreign-key"])
 def fk_validate():
-    """Step 3: validate the FK against the whole table.
+    """Step 3: validate the equivalent FK against the whole table.
 
-    Runs under a SHARE UPDATE EXCLUSIVE lock: legitimate reads and writes
-    keep committing during the scan. If orphan rows remain, validation
-    fails with 409 and write protection stays ON (the constraint remains
-    NOT VALID); fix the orphans and call this again.
+    The exact constraint is selected from the catalog (by definition, not by
+    name) and then locked together with the VALIDATE: both run in one
+    transaction after ``LOCK TABLE ... SHARE UPDATE EXCLUSIVE``, which allows
+    ordinary reads and writes but blocks RENAME / DROP / REPLACE.  If the
+    selected constraint disappears before we take the lock, we re-read the
+    catalog and retry; we never validate a constraint we did not select.
+
+    Legitimate writes keep committing during the scan. If orphan rows remain,
+    validation fails with 409 and write protection stays ON (the constraint
+    remains NOT VALID); fix the orphans and call this again.
     """
-    status = read_fk_status()
-    if not status["exists"]:
-        raise HTTPException(
-            status_code=409,
-            detail="foreign key not enabled yet; POST /foreign-key/enable first",
-        )
-    if status["validated"]:
-        return {"changed": False, **status}
-    try:
-        with connect(autocommit=True) as conn:
-            conn.execute(VALIDATE_FK_SQL)
-    except ForeignKeyViolation as exc:
+    for attempt in range(3):
         with connect() as conn:
-            detail = {
-                "message": (
-                    "validation failed: orphan inspection rows remain; "
-                    "write protection stays ON"
-                ),
-                "postgres_error": exc.diag.message_primary,
-                "orphan_count": orphan_count(conn),
-                "orphan_sample": orphan_rows(conn, 5),
-                "write_protection": "enforced (constraint remains NOT VALID)",
-            }
-        # jsonable_encoder: detail contains datetimes, and the default
-        # HTTPException handler serializes with plain json.dumps
-        raise HTTPException(status_code=409, detail=jsonable_encoder(detail))
-    return {"changed": True, **read_fk_status()}
+            candidates = find_equivalent_fks(conn)
+            if not candidates:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "no equivalent foreign key exists; "
+                        "POST /foreign-key/enable first"
+                    ),
+                )
+            chosen = candidates[0]
+            try:
+                # Blocks concurrent RENAME/DROP/REPLACE from here on, while
+                # leaving INSERT/UPDATE/DELETE unaffected.
+                conn.execute(LOCK_FOR_VALIDATE_SQL)
+                current = conn.execute(
+                    EQUIVALENT_FK_BY_OID_SQL, {"oid": chosen["oid"]}
+                ).fetchone()
+                if current is None:
+                    # Renamed *and* replaced between SELECT and LOCK: our
+                    # selection is stale, start over instead of guessing.
+                    conn.rollback()
+                    continue
+                if current[2]:
+                    conn.rollback()
+                    return {
+                        "changed": False,
+                        **_fk_row_to_status(current),
+                        "equivalent_constraints": [
+                            f["constraint"] for f in candidates
+                        ],
+                    }
+                conn.execute(validate_fk_sql(current[1]))
+                validated = conn.execute(
+                    EQUIVALENT_FK_BY_OID_SQL, {"oid": chosen["oid"]}
+                ).fetchone()
+                conn.commit()
+                return {
+                    "changed": True,
+                    **_fk_row_to_status(validated or current),
+                    "equivalent_constraints": [
+                        f["constraint"] for f in candidates
+                    ],
+                }
+            except ForeignKeyViolation as exc:
+                conn.rollback()
+                with connect() as probe:
+                    detail = {
+                        "message": (
+                            "validation failed: orphan inspection rows "
+                            "remain; write protection stays ON"
+                        ),
+                        "postgres_error": exc.diag.message_primary,
+                        "constraint": chosen["constraint"],
+                        "orphan_count": orphan_count(probe),
+                        "orphan_sample": orphan_rows(probe, 5),
+                        "write_protection": (
+                            "enforced (constraint remains NOT VALID)"
+                        ),
+                    }
+                # jsonable_encoder: detail contains datetimes, and the default
+                # HTTPException handler serializes with plain json.dumps
+                raise HTTPException(
+                    status_code=409, detail=jsonable_encoder(detail)
+                )
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "the selected foreign key kept changing while validation tried "
+            "to lock it; re-check /foreign-key/status and retry"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
